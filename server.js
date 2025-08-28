@@ -1,6 +1,6 @@
 import express from 'express';
 import multer from 'multer';
-import PDFParser from 'pdf2json';
+import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { createClient } from '@deepgram/sdk';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -65,19 +65,54 @@ function broadcast(message) {
 }
 
 // Function to split text into chunks
-function splitTextIntoChunks(text, maxChunkSize = 500) {
+function splitTextIntoChunks(text, maxChunkSize = 300) {
+    // Clean up the text first
+    text = text.replace(/\s+/g, ' ').trim();
+    
+    // Split into sentences first
     const sentences = text.match(/[^\.!?]+[\.!?]+/g) || [text];
     const chunks = [];
     let currentChunk = '';
 
     for (const sentence of sentences) {
-        if (currentChunk.length + sentence.length <= maxChunkSize) {
-            currentChunk += sentence;
-        } else {
+        const trimmedSentence = sentence.trim();
+        
+        // If adding this sentence would exceed the limit
+        if (currentChunk.length + trimmedSentence.length > maxChunkSize) {
+            // If we have content in current chunk, push it
             if (currentChunk) {
                 chunks.push(currentChunk.trim());
+                currentChunk = '';
             }
-            currentChunk = sentence;
+            
+            // If the sentence itself is too long, split it by words
+            if (trimmedSentence.length > maxChunkSize) {
+                const words = trimmedSentence.split(/\s+/);
+                let wordChunk = '';
+                
+                for (const word of words) {
+                    // If adding this word would exceed the limit
+                    if (wordChunk.length + word.length + 1 > maxChunkSize) {
+                        if (wordChunk) {
+                            chunks.push(wordChunk.trim());
+                            wordChunk = word;
+                        } else {
+                            // Single word is too long, just add it
+                            chunks.push(word);
+                        }
+                    } else {
+                        wordChunk += (wordChunk ? ' ' : '') + word;
+                    }
+                }
+                
+                if (wordChunk) {
+                    currentChunk = wordChunk;
+                }
+            } else {
+                currentChunk = trimmedSentence;
+            }
+        } else {
+            currentChunk += (currentChunk ? ' ' : '') + trimmedSentence;
         }
     }
 
@@ -91,13 +126,22 @@ function splitTextIntoChunks(text, maxChunkSize = 500) {
 // Function to convert text to speech using Deepgram
 async function convertTextToSpeech(text, chunkIndex) {
     try {
+        // Clean and prepare text for better speech synthesis
+        const cleanText = text
+            .replace(/\s+/g, ' ')  // Normalize whitespace
+            .replace(/([.!?])\s*$/, '$1')  // Ensure proper punctuation at end
+            .trim();
+
         const options = {
-            model: process.env.TTS_MODEL || 'aura-asteria-en',
-            encoding: 'mp3'
+            model: process.env.TTS_MODEL || 'aura-luna-en',
+            encoding: 'linear16',
+            sample_rate: 24000
         };
 
+        console.log(`Converting chunk ${chunkIndex}: "${cleanText.substring(0, 100)}${cleanText.length > 100 ? '...' : ''}"`);
+
         const response = await deepgram.speak.request(
-            { text },
+            { text: cleanText },
             options
         );
 
@@ -156,46 +200,52 @@ app.post('/upload', upload.single('pdf'), async (req, res) => {
     }
 
     try {
-        // Read and parse PDF using pdf2json
-        const pdfParser = new PDFParser();
+        // Read PDF file
+        const pdfBuffer = fs.readFileSync(req.file.path);
+        const pdfData = new Uint8Array(pdfBuffer);
         
-        // Promise wrapper for pdf2json
-        const parsePDF = () => {
-            return new Promise((resolve, reject) => {
-                pdfParser.on('pdfParser_dataError', reject);
-                pdfParser.on('pdfParser_dataReady', (pdfData) => {
-                    // Extract text from parsed PDF data
-                    let extractedText = '';
-                    if (pdfData.Pages) {
-                        pdfData.Pages.forEach(page => {
-                            if (page.Texts) {
-                                page.Texts.forEach(textItem => {
-                                    textItem.R.forEach(textRun => {
-                                        extractedText += decodeURIComponent(textRun.T) + ' ';
-                                    });
-                                });
-                            }
-                        });
-                    }
-                    resolve(extractedText.trim());
-                });
-                
-                // Load PDF file
-                pdfParser.loadPDF(req.file.path);
-            });
-        };
-
-        const extractedText = await parsePDF();
+        // Parse PDF using pdfjs
+        const pdfDoc = await pdfjs.getDocument({data: pdfData}).promise;
+        let extractedText = '';
+        
+        // Extract text from each page
+        for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+            const page = await pdfDoc.getPage(pageNum);
+            const textContent = await page.getTextContent();
+            
+            // Combine text items into readable text
+            const pageText = textContent.items
+                .map(item => item.str)
+                .join(' ');
+            
+            extractedText += pageText + ' ';
+        }
         
         // Clean up uploaded file
         fs.unlinkSync(req.file.path);
         
-        if (!extractedText) {
+        if (!extractedText || extractedText.trim().length === 0) {
             return res.status(400).json({ error: 'No text found in PDF' });
         }
 
+        // Clean up the extracted text
+        extractedText = extractedText
+            .replace(/\s+/g, ' ')  // Replace multiple spaces with single space
+            .replace(/\n+/g, ' ')  // Replace newlines with spaces
+            .replace(/\s+([.!?])/g, '$1')  // Remove spaces before punctuation
+            .trim();
+
+        console.log(`Extracted text length: ${extractedText.length} characters`);
+        console.log(`Sample text: "${extractedText.substring(0, 200)}..."`);
+
         // Split text into chunks
         const textChunks = splitTextIntoChunks(extractedText);
+        
+        // Log the first few chunks to verify they look correct
+        console.log('Sample chunks:');
+        textChunks.slice(0, 3).forEach((chunk, index) => {
+            console.log(`Chunk ${index}: "${chunk.substring(0, 100)}${chunk.length > 100 ? '...' : ''}"`);
+        });
         
         broadcast({
             type: 'processing_started',
