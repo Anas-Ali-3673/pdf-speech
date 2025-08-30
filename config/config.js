@@ -5,7 +5,7 @@ dotenv.config();
 export const config = {
     port: process.env.PORT || 3000,
     deepgramApiKey: process.env.DEEPGRAM_API_KEY,
-    ttsModel: process.env.TTS_MODEL || 'aura-luna-en',
+    ttsModel: process.env.TTS_MODEL || 'aura-2-iris-en',
     uploadLimits: {
         fileSize: 10 * 1024 * 1024 
     },
